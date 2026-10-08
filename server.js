@@ -18,6 +18,7 @@ const io = new Server(server, {
 });
 
 const players = {};
+const lastMoveAt = {}; // socket id -> ms timestamp of last accepted movement; cleared on respawn
 const MAX_HP = 100;
 const spawnPoints = [
   { x: 0, y: 8, z: 0 },
@@ -28,6 +29,37 @@ const spawnPoints = [
   { x: 8, y: 8, z: -24 },
   { x: -8, y: 8, z: 24 }
 ];
+
+// Server-authoritative weapon stats (mirror of main.js); client-reported damage is ignored.
+const WEAPONS = {
+  assault: { damage: 24, fireRate: 92, range: 120 },
+  smg: { damage: 18, fireRate: 62, range: 80 },
+  shotgun: { damage: 14, fireRate: 640, range: 50 }
+};
+const DEFAULT_LOADOUT = 'assault';
+const HEADSHOT_MULTIPLIER = 1.8;
+const FIRE_RATE_TOLERANCE = 0.8;   // allow jitter: min interval = fireRate * 0.8
+const RANGE_TOLERANCE = 1.25;      // latency slack on hit distance
+const MAX_MOVE_SPEED = 30;         // units/s; sprint ~8, slide boost ~2x, plus slack
+const MAX_VERTICAL_SPEED = 60;     // units/s; jumps and falls
+const MAX_ORIGIN_OFFSET = 10;      // shot origin must be near server-known position
+const WORLD_LIMIT = 100;
+const MIN_Y = -50;
+const MAX_Y = 100;
+const PLAYER_STATES = new Set(['idle', 'running', 'sprinting']);
+
+function isVec3(v) {
+  return !!v && Number.isFinite(v.x) && Number.isFinite(v.y) && Number.isFinite(v.z);
+}
+
+function isInWorld(v) {
+  return isVec3(v) && Math.abs(v.x) <= WORLD_LIMIT && Math.abs(v.z) <= WORLD_LIMIT &&
+    v.y >= MIN_Y && v.y <= MAX_Y;
+}
+
+function distance(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+}
 
 function pickSpawn() {
   return spawnPoints[Math.floor(Math.random() * spawnPoints.length)];
@@ -57,8 +89,10 @@ io.on('connection', (socket) => {
     kills: 0,
     deaths: 0,
     state: 'idle',
-    isDead: false
+    isDead: false,
+    loadout: DEFAULT_LOADOUT
   };
+  let lastShotAt = 0;
 
   // Sync current state
   socket.emit('currentPlayers', players);
@@ -68,75 +102,104 @@ io.on('connection', (socket) => {
   socket.on('playerProfile', (profile = {}) => {
     if (!players[socket.id]) return;
     players[socket.id].name = String(profile.name || players[socket.id].name).slice(0, 16);
-    players[socket.id].loadout = profile.loadout || players[socket.id].loadout;
+    if (typeof profile.loadout === 'string' && Object.hasOwn(WEAPONS, profile.loadout)) {
+      players[socket.id].loadout = profile.loadout;
+    }
     emitLobbyStats();
   });
 
   // Movement
   socket.on('playerMovement', (movementData) => {
-    if (players[socket.id] && !players[socket.id].isDead) {
-      players[socket.id].position = movementData.position;
-      players[socket.id].rotation = movementData.rotation;
-      players[socket.id].state = movementData.state;
-      socket.broadcast.emit('playerMoved', players[socket.id]);
+    const player = players[socket.id];
+    if (!player || player.isDead || !movementData) return;
+    const { position, rotation, state } = movementData;
+    if (!isInWorld(position) || !rotation || !Number.isFinite(rotation.y)) return;
+
+    const now = Date.now();
+    if (lastMoveAt[socket.id]) {
+      // Reject teleports / speed hacks and resync the client to its last accepted position
+      const dt = Math.min(Math.max((now - lastMoveAt[socket.id]) / 1000, 0.016), 1);
+      const horizontal = Math.hypot(position.x - player.position.x, position.z - player.position.z);
+      const vertical = Math.abs(position.y - player.position.y);
+      if (horizontal / dt > MAX_MOVE_SPEED || vertical / dt > MAX_VERTICAL_SPEED) {
+        socket.emit('playerMoved', player);
+        return;
+      }
     }
+    lastMoveAt[socket.id] = now;
+
+    player.position = { x: position.x, y: position.y, z: position.z };
+    player.rotation = { x: 0, y: rotation.y, z: 0 };
+    player.state = PLAYER_STATES.has(state) ? state : 'running';
+    socket.broadcast.emit('playerMoved', player);
   });
 
   // Combat: Handle Shooting
   socket.on('playerShoot', (hitData) => {
-    if (players[socket.id] && !players[socket.id].isDead) {
-      // Broadcast muzzle flash/sound effect to others
-      socket.broadcast.emit('playerFired', {
-        id: socket.id,
-        origin: hitData.origin,
-        end: hitData.end
-      });
+    const shooter = players[socket.id];
+    if (!shooter || shooter.isDead || !hitData) return;
 
-      // If a player was hit
-      if (hitData.targetId && players[hitData.targetId] && !players[hitData.targetId].isDead) {
-        const target = players[hitData.targetId];
-        const baseDamage = Math.max(1, Math.min(Number(hitData.damage) || 25, 120));
-        const damage = hitData.headshot ? Math.round(baseDamage * 1.8) : baseDamage;
-        target.health -= damage;
+    const weapon = WEAPONS[shooter.loadout] || WEAPONS[DEFAULT_LOADOUT];
+    const now = Date.now();
+    if (now - lastShotAt < weapon.fireRate * FIRE_RATE_TOLERANCE) return;
+    if (!isVec3(hitData.origin) || !isVec3(hitData.end)) return;
+    if (distance(hitData.origin, shooter.position) > MAX_ORIGIN_OFFSET) return;
+    lastShotAt = now;
 
-        if (target.health <= 0) {
-          target.health = 0;
-          target.isDead = true;
-          target.deaths += 1;
-          players[socket.id].kills += 1;
+    // Broadcast muzzle flash/sound effect to others
+    socket.broadcast.emit('playerFired', {
+      id: socket.id,
+      origin: hitData.origin,
+      end: hitData.end
+    });
 
-          // Notify everyone of the kill
-          io.emit('playerKilled', {
-            killerId: socket.id,
-            victimId: target.id,
-            damage,
-            headshot: !!hitData.headshot,
-            killerStats: players[socket.id],
-            victimStats: target
-          });
-          emitLobbyStats();
+    // If a player was hit
+    const target = typeof hitData.targetId === 'string' ? players[hitData.targetId] : null;
+    if (target && target.id !== socket.id && !target.isDead &&
+        (!target.isBot || target.ownerId === socket.id) &&
+        distance(shooter.position, target.position) <= weapon.range * RANGE_TOLERANCE) {
+      const headshot = hitData.headshot === true;
+      const damage = headshot ? Math.round(weapon.damage * HEADSHOT_MULTIPLIER) : weapon.damage;
+      target.health -= damage;
 
-          // Respawn the dead player after 3 seconds
-          setTimeout(() => {
-            if (players[target.id]) {
-              players[target.id].health = MAX_HP;
-              players[target.id].isDead = false;
-              players[target.id].position = pickSpawn();
-              io.emit('playerRespawned', players[target.id]);
-              emitLobbyStats();
-            }
-          }, 3000);
-        } else {
-          // Notify the target they took damage
-          io.emit('playerDamaged', {
-            id: target.id,
-            attackerId: socket.id,
-            health: target.health,
-            damage,
-            headshot: !!hitData.headshot
-          });
-          emitLobbyStats();
-        }
+      if (target.health <= 0) {
+        target.health = 0;
+        target.isDead = true;
+        target.deaths += 1;
+        players[socket.id].kills += 1;
+
+        // Notify everyone of the kill
+        io.emit('playerKilled', {
+          killerId: socket.id,
+          victimId: target.id,
+          damage,
+          headshot,
+          killerStats: players[socket.id],
+          victimStats: target
+        });
+        emitLobbyStats();
+
+        // Respawn the dead player after 3 seconds
+        setTimeout(() => {
+          if (players[target.id]) {
+            players[target.id].health = MAX_HP;
+            players[target.id].isDead = false;
+            players[target.id].position = pickSpawn();
+            delete lastMoveAt[target.id];
+            io.emit('playerRespawned', players[target.id]);
+            emitLobbyStats();
+          }
+        }, 3000);
+      } else {
+        // Notify the target they took damage
+        io.emit('playerDamaged', {
+          id: target.id,
+          attackerId: socket.id,
+          health: target.health,
+          damage,
+          headshot
+        });
+        emitLobbyStats();
       }
     }
   });
@@ -165,6 +228,7 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     console.log(`Player disconnected: ${socket.id}`);
     delete players[socket.id];
+    delete lastMoveAt[socket.id];
     if (players['bot_' + socket.id]) {
       delete players['bot_' + socket.id];
     }
@@ -226,6 +290,7 @@ setInterval(() => {
               players[target.id].health = MAX_HP;
               players[target.id].isDead = false;
               players[target.id].position = pickSpawn();
+              delete lastMoveAt[target.id];
               io.to(bot.ownerId).emit('playerRespawned', players[target.id]);
             }
           }, 3000);
